@@ -7,14 +7,6 @@ import json
 import torch.nn as nn
 import torch.nn.functional as F
 
-import cifar10
-import mnist
-
-train_dl = cifar10.get_trainloader()
-test_dl = cifar10.get_testloader()
-
-# train_dl = mnist.get_trainloader()
-# test_dl = mnist.get_testloader()
 
 class FCNet(nn.Module):
     def __init__(self, input_dim=(32*32*3), r_0=None, d=None):
@@ -67,6 +59,7 @@ class FCNet(nn.Module):
 
         return x
 
+
 class RandomHyperplaneNet(FCNet):
     def __init__(self, d=None, r_0=None, input_dim=(32*32*3)):
         nn.Module.__init__(self)
@@ -82,6 +75,9 @@ class RandomHyperplaneNet(FCNet):
         if r_0 is None:
             r_0 = self.r_xavier
 
+        self.make_params(r_0)
+
+    def make_params(self, r_0):
         # The coordinates in the d-dimensional subspace
         self.weights = nn.Parameter(torch.zeros(self.d))
         # The fixed offset P into parameter space
@@ -143,113 +139,49 @@ class SparseRandomHyperplaneNet(RandomHyperplaneNet):
         return self.offset + torch.sparse.mm(self.M, w).view(-1)
 
 
+class RadiusConstrain(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input):
+        ctx.save_for_backward(input)
+        # Need to do dummy operation so that it's not optimized out
+        return input.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, = ctx.saved_tensors
+
+        # Subtract off the radial component of the gradient
+        r_hat = input / input.norm()
+        grad_input = grad_output.clone()
+        grad_input -= torch.dot(r_hat, grad_output) * r_hat
+        return grad_input
+
+radius_constrain = RadiusConstrain.apply
+
+
+class HypersphereFCNet(FCNet):
+
+    def get_params(self):
+        return radius_constrain(self.weights)
+
+
+class SparseHypersphereNet(SparseRandomHyperplaneNet):
+
+    def make_params(self, r_0):
+        # The coordinates in the d-dimensional subspace
+        w = torch.randn(self.d, device='cuda')
+        w *= r_0 / w.norm()
+        self.weights = nn.Parameter(w)
+        # Transformation matrix from d subspace into full D space
+        self.M = self.get_random_ortho_matrix(self.D, self.d)
+
+    def get_params(self):
+        w = radius_constrain(self.weights).view(-1, 1)
+        return torch.sparse.mm(self.M, w).view(-1)
+        # params = torch.sparse.mm(self.M, self.weights).view(-1)
+        # return radius_constrain(params)
+
+
 # Too long of a function name
 def f(D, d):
     return SparseRandomHyperplaneNet.get_random_ortho_matrix(None, D, d)
-
-def train(n_epochs=10, epoch_start=0,
-         Net=FCNet, net=None, log=None, **kwargs):
-
-    if net is None:
-        print('Making Network...')
-        net = Net(**kwargs)
-        net.to('cuda')
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
-
-    if log is None:
-        log = collections.defaultdict(list)
-    print_every = 100
-    examples_seen = 0
-    batch_size = train_dl.batch_size
-    n_examples = len(train_dl.dataset.targets)
-
-    def get_test_acc():
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for data in test_dl:
-                images, labels = data
-                images = images.to('cuda')
-                labels = labels.to('cuda')
-                outputs = net(images)
-                _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-        return correct/total 
-
-    log['test_acc'].append((epoch_start, get_test_acc()))
-    log['radius'].append((epoch_start, net.get_radius()))
-    log['radii'].append([epoch_start] + net.get_radii()))
-    # TODO get the training loss at initialization as well!
-
-    print('Starting Training...')
-    for epoch in range(epoch_start, epoch_start + n_epochs):
-        running_loss = 0
-        for i, data in enumerate(train_dl):
-            inputs = data[0].to('cuda')
-            labels = data[1].to('cuda')
-
-            optimizer.zero_grad()
-            outputs = net(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            examples_seen += len(labels)
-            running_loss += loss.item()
-
-            # print statistics
-            if i % print_every == (print_every - 1):
-                avg_loss = running_loss / print_every
-                t = epoch + (i * batch_size / n_examples)
-                running_loss = 0
-
-                r = net.get_radius()
-                log['loss'].append((t, avg_loss))
-                log['radius'].append((t, r))
-
-                if epoch < 1:
-                    test_acc = get_test_acc()
-                    log['test_acc'].append((t, test_acc))
-                    print('[Epoch %.2f] loss: %.3f, radius: %.3f, test accuracy: %.2f%%' % (t, avg_loss, r, test_acc * 100))
-                else:
-                    print('[Epoch %.2f] loss: %.3f, radius: %.3f' % (t, avg_loss, r), end='\r')
-
-        t = epoch + 1
-        test_acc = get_test_acc()
-        log['test_acc'].append((t, test_acc))
-        # avg_loss = running_loss / (i % print_every)
-        # log['loss'].append((t, avg_loss))
-        r = net.get_radius()
-        log['radius'].append((t, r))
-        rs = net.get_radii()
-        log['radii'].append([t] + rs)
-
-        print('[Epoch %d] loss: %.3f, radius: %.3f, test accuracy: %.2f%%' % (t, avg_loss, r, test_acc * 100))
-
-    print('Finished Training')
-    return log,net
-
-with open('experiment_4.json', 'r') as f:
-    logs = json.load(f)
-
-# for d in [300, 1000, 3000, 7000, 10000]:
-for d in [7000, 10000]:
-    for r_0 in [0.2, 50, 200]:
-        print('--- d = %d, r_0 = %d ---' % (d, r_0))
-        log, net = train(n_epochs=20, r_0=r_0, d=d,
-                        Net=SparseRandomHyperplaneNet)
-        log['d'] = d
-        log['r_0'] = r_0
-        logs.append(log)
-
-with open('experiment_4b.json', 'w') as f:
-    json.dump(logs)
-
-# logs = []
-# for r_0 in [0.2, 2, 20, 50, 200, 2000]:
-#     print('--- r_0=%d ---' % r_0)
-#     log,net = train(n_epochs=10, r_0=r_0)
-#     logs.append(log)
